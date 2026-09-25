@@ -1337,6 +1337,153 @@ export function suggestExpansion(network: Network, query: CapacityQuery): Expans
   };
 }
 
+// ============ 双阀意外关闭风险扫描 ============
+
+/** 双阀风险扫描参与枚举的当前开启阀门数量上限 */
+export const MAX_RISK_OPEN_VALVES = 20;
+
+/** 一个单阀 / 两阀意外关闭场景的测算结果。 */
+export interface ValveRiskScenario {
+  /** 场景类型：单阀意外关闭 / 两阀意外关闭 */
+  kind: 'single' | 'pair';
+  /** 被意外关闭的阀门编号（升序；单阀时仅 1 个） */
+  closedValves: string[];
+  /** 该场景下按现有无向管段共享容量模型重算的总获配量 */
+  totalAllocated: number;
+  /** 新增缺口 = 基线总获配 - 该场景总获配（恒为正，仅列出有新增缺口的场景） */
+  addedShortfall: number;
+  /**
+   * 两阀场景：新增缺口是否严格大于两个对应单阀新增缺口之和（协同失供）；
+   * 单阀场景恒为 false。
+   */
+  synergistic: boolean;
+}
+
+export interface ValveRiskOk {
+  status: 'ok';
+  /** 参与扫描的当前开启阀门数 */
+  openValveCount: number;
+  /** 参与输水的管段总数（无阀管段 + 当前开启的带阀管段；自环不计） */
+  activePipeCount: number;
+  /** 不模拟任何意外关闭时的总获配量（基线） */
+  baselineAllocated: number;
+  /** 模拟场景总数 = 单阀 n 个 + 两阀 C(n,2) 个 */
+  scenarioCount: number;
+  /**
+   * 全部有新增缺口的场景：按新增缺口降序，同缺口按阀门编号列表字典序。
+   * 无任何有新增缺口的场景时为空清单。
+   */
+  lossScenarios: ValveRiskScenario[];
+}
+
+export interface ValveRiskInvalid {
+  status: 'invalid';
+  errors: string[];
+}
+
+export type ValveRiskResult = ValveRiskOk | ValveRiskInvalid;
+
+/** 阀门编号（升序）列表的字典序比较：逐编号比较，前缀较短者优先。 */
+function compareValveLists(a: readonly string[], b: readonly string[]): number {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+  }
+  return a.length - b.length;
+}
+
+/**
+ * 双阀意外关闭风险扫描：沿用现有拓扑、阀门登记状态与供水能力填写表，
+ * 不改登记状态，仅对**当前开启**的阀门（最多 MAX_RISK_OPEN_VALVES 个）
+ * 模拟「单个阀门意外关闭」与「两个阀门同时意外关闭」场景。
+ *
+ * - 基线与每个场景均按现有供水能力核验模型重算最大获配：无阀管段与当前开启的
+ *   带阀管段为双向共享容量 1 的无向边；被模拟关闭的阀门对应管段从场景中移除，
+ *   已关阀与自环本就不参与输水；
+ * - 以「场景总获配相对基线减少的数值」为**新增缺口**，仅列出新增缺口 > 0 的
+ *   场景，按新增缺口降序、阀门编号（升序）列表字典序展示全部有损场景；
+ * - 两阀场景的新增缺口**严格大于**两个对应单阀新增缺口之和时标为**协同失供**
+ *   （两阀同时关闭的额外损失超出各自单独关闭的损失之和）；
+ * - 无任何有损场景时返回空清单，由页面明确提示。
+ * 纯函数，不修改输入拓扑、登记的阀门状态与数值表。
+ */
+export function scanValveClosureRisk(network: Network, query: CapacityQuery): ValveRiskResult {
+  const { valid, errors } = validateCapacityQuery(network, query);
+  if (!valid) return { status: 'invalid', errors };
+  const { supplyCapList, demandList } = valid;
+
+  const openValves = network.valvedPipes.filter((v) => v.open).map((v) => v.id).sort();
+  if (openValves.length > MAX_RISK_OPEN_VALVES) {
+    return {
+      status: 'invalid',
+      errors: [
+        `当前开启的阀门有 ${openValves.length} 个，超过风险扫描上限 ${MAX_RISK_OPEN_VALVES} 个；` +
+        '请先在输入中将部分阀门标记为关闭（"open": false）后再扫描。',
+      ],
+    };
+  }
+
+  const baseEdges = collectActiveEdges(network);
+
+  /** 在模拟关闭指定开启阀门后的管段集合上重算总获配（不改动登记状态）。 */
+  const allocatedWithClosed = (closed: ReadonlySet<string>): number => {
+    const edges = closed.size === 0 ? baseEdges : baseEdges.filter((e) => !closed.has(e.id));
+    return computeTotalAllocated(network, supplyCapList, demandList, edges, () => 1);
+  };
+
+  const baselineAllocated = allocatedWithClosed(new Set());
+
+  // 单阀场景：编号升序计算，同时保存各单阀新增缺口供协同判定
+  const singleShortfall = new Map<string, number>();
+  for (const id of openValves) {
+    const allocated = allocatedWithClosed(new Set([id]));
+    singleShortfall.set(id, baselineAllocated - allocated);
+  }
+
+  // 两阀场景：仅当存在新增缺口时才保留；协同判定在汇总排序前完成
+  const pairScenarios: ValveRiskScenario[] = [];
+  for (let i = 0; i < openValves.length; i++) {
+    for (let j = i + 1; j < openValves.length; j++) {
+      const a = openValves[i];
+      const b = openValves[j];
+      const allocated = allocatedWithClosed(new Set([a, b]));
+      const addedShortfall = baselineAllocated - allocated;
+      if (addedShortfall <= 0) continue;
+      pairScenarios.push({
+        kind: 'pair',
+        closedValves: [a, b],
+        totalAllocated: allocated,
+        addedShortfall,
+        synergistic: addedShortfall > (singleShortfall.get(a)! + singleShortfall.get(b)!),
+      });
+    }
+  }
+
+  const singleScenarios: ValveRiskScenario[] = openValves
+    .map((id) => ({
+      kind: 'single' as const,
+      closedValves: [id],
+      totalAllocated: baselineAllocated - singleShortfall.get(id)!,
+      addedShortfall: singleShortfall.get(id)!,
+      synergistic: false,
+    }))
+    .filter((s) => s.addedShortfall > 0);
+
+  const lossScenarios = [...singleScenarios, ...pairScenarios].sort((a, b) => {
+    if (a.addedShortfall !== b.addedShortfall) return b.addedShortfall - a.addedShortfall;
+    return compareValveLists(a.closedValves, b.closedValves);
+  });
+
+  const n = openValves.length;
+  return {
+    status: 'ok',
+    openValveCount: n,
+    activePipeCount: baseEdges.length,
+    baselineAllocated,
+    scenarioCount: n + (n * (n - 1)) / 2,
+    lossScenarios,
+  };
+}
+
 // ============ 阀门状态异常定位 ============
 
 /** 异常定位最多枚举的阀门状态翻转处数 */

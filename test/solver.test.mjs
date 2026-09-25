@@ -849,5 +849,101 @@ const o8 = solver.planSingleValveObservers(noValveNet, { supplies: ['S'], candid
 check('无阀门时仅 1 个假设且标记不可区分', o8.status === 'ok' &&
   o8.hypothesisCount === 1 && o8.distinguishable === false);
 
+// ============ 双阀意外关闭风险扫描 ============
+console.log('双阀意外关闭风险扫描：');
+
+const risk = (net, supplies, outlets, supplyCaps, outletDemands) =>
+  solver.scanValveClosureRisk(net, { supplies, outlets, supplyCaps, outletDemands });
+const riskRow = (r, ...ids) =>
+  r.lossScenarios.find((s) => s.closedValves.join(',') === ids.join(','));
+
+// 测试主网络：基线受 V01/V02 入环限制为 2（与供水能力核验一致）
+const rk1 = risk(network, ['S1', 'S2'], ['B', 'C', 'D'], { S1: 5, S2: 3 }, { B: 2, C: 1, D: 1 });
+check('扫描返回 ok', rk1.status === 'ok');
+check('基线总获配与核验一致（2）', rk1.baselineAllocated === 2);
+check('开启阀门 8 个（已关 V09 不参与）', rk1.openValveCount === 8);
+check('场景总数 = 8 单阀 + 28 两阀', rk1.scenarioCount === 36);
+check('参与输水管段 10 条（2 无阀 + 8 开启）', rk1.activePipeCount === 10);
+// 有损场景：单阀 V01/V02（各 1）；两阀 [V01,V02] 缺口 2；
+// 其余缺口 1：V01/V02 各与 V03..V08 组合（12 对）+ 协同 7 对（共 22 个）
+check('全部有损场景均列出（2 单阀 + 20 两阀 = 22）', rk1.lossScenarios.length === 22);
+// 单阀：关 V01 / V02 各使入环能力 -1
+const rkV01 = riskRow(rk1, 'V01');
+check('单关 V01：获配 1、新增缺口 1', rkV01.kind === 'single' &&
+  rkV01.totalAllocated === 1 && rkV01.addedShortfall === 1 && rkV01.synergistic === false);
+check('单关 V02：获配 1、新增缺口 1', riskRow(rk1, 'V02').addedShortfall === 1);
+check('单关 V03 / V05 无新增缺口（不入清单）',
+  riskRow(rk1, 'V03') === undefined && riskRow(rk1, 'V05') === undefined);
+// 两阀同时关 V01、V02：入环能力归零
+const rkPair12 = riskRow(rk1, 'V01', 'V02');
+check('两阀 [V01,V02]：获配 0、新增缺口 2', rkPair12.kind === 'pair' &&
+  rkPair12.totalAllocated === 0 && rkPair12.addedShortfall === 2);
+check('两阀 [V01,V02] 非协同（2 不大于 1+1）', rkPair12.synergistic === false);
+// 含单阀损失的两阀对：缺口 1 但单阀之和已为 1，不标协同
+check('[V01,V05] 缺口 1 但非协同（1 不大于 1+0）',
+  riskRow(rk1, 'V01', 'V05').addedShortfall === 1 &&
+  riskRow(rk1, 'V01', 'V05').synergistic === false);
+// 协同失供：两阀单关均无损，同关才切断独立路径
+const rkPair35 = riskRow(rk1, 'V03', 'V05');
+check('两阀 [V03,V05]：获配 1、新增缺口 1', rkPair35.totalAllocated === 1 && rkPair35.addedShortfall === 1);
+check('两阀 [V03,V05] 标为协同失供（1 > 0+0）', rkPair35.synergistic === true);
+check('其余协同对 [V03,V08]、[V04,V05]、[V04,V08]、[V05,V06]、[V05,V08]、[V07,V08] 均标出',
+  ['V03,V08', 'V04,V05', 'V04,V08', 'V05,V06', 'V05,V08', 'V07,V08']
+    .every((k) => riskRow(rk1, ...k.split(',')).synergistic === true));
+check('非协同对 [V03,V06]、[V04,V06] 无损（不入清单）',
+  riskRow(rk1, 'V03', 'V06') === undefined && riskRow(rk1, 'V04', 'V06') === undefined);
+// 排序：新增缺口降序；同缺口按阀门编号列表字典序（短列表为长列表前缀时短者在前）
+check('有损场景按缺口降序 + 编号列表字典序排列',
+  rk1.lossScenarios.map((s) => s.closedValves.join('+')).join('|') === [
+    'V01+V02',
+    'V01', 'V01+V03', 'V01+V04', 'V01+V05', 'V01+V06', 'V01+V07', 'V01+V08',
+    'V02', 'V02+V03', 'V02+V04', 'V02+V05', 'V02+V06', 'V02+V07', 'V02+V08',
+    'V03+V05', 'V03+V08', 'V04+V05', 'V04+V08', 'V05+V06', 'V05+V08', 'V07+V08',
+  ].join('|'));
+
+console.log('风险扫描：无有损场景时明确提示（空清单）：');
+// 供水点经 8 条并行管接出口：任意两阀同关仍留有 6 条通道，供给上限 2 为瓶颈
+const noLossNet = {
+  nodes: ['S', 'O'],
+  pipes: [],
+  valvedPipes: Array.from({ length: 8 }, (_, i) => ({ id: `V${i}`, from: 'S', to: 'O', open: true })),
+};
+const rk2 = risk(noLossNet, ['S'], ['O'], { S: 2 }, { O: 9 });
+check('返回 ok 且基线 2', rk2.status === 'ok' && rk2.baselineAllocated === 2);
+check('36 个场景全部无损（空清单）', rk2.scenarioCount === 36 && rk2.lossScenarios.length === 0);
+
+console.log('风险扫描：零开启阀门与上限校验：');
+const noOpenNet = {
+  nodes: ['S', 'O'],
+  pipes: [{ id: 'P1', from: 'S', to: 'O' }],
+  valvedPipes: [{ id: 'V1', from: 'S', to: 'O', open: false }],
+};
+const rk3 = risk(noOpenNet, ['S'], ['O'], { S: 5 }, { O: 5 });
+check('零开启阀门：0 场景、空清单', rk3.status === 'ok' &&
+  rk3.openValveCount === 0 && rk3.scenarioCount === 0 && rk3.lossScenarios.length === 0);
+const overNet = {
+  nodes: ['a', 'b'],
+  pipes: [],
+  valvedPipes: Array.from({ length: 21 }, (_, i) => ({ id: `V${i}`, from: 'a', to: 'b', open: true })),
+};
+const rk4 = risk(overNet, ['a'], ['b'], { a: 1 }, { b: 1 });
+check('超过 20 个开启阀门被拒绝', rk4.status === 'invalid' && rk4.errors.some((e) => e.includes('21')));
+const exactNet = {
+  nodes: ['a', 'b'],
+  pipes: [],
+  valvedPipes: Array.from({ length: 20 }, (_, i) => ({ id: `V${i}`, from: 'a', to: 'b', open: true })),
+};
+const rk5 = risk(exactNet, ['a'], ['b'], { a: 3 }, { b: 9 });
+check('恰好 20 个开启阀门可扫描（210 场景）', rk5.status === 'ok' && rk5.scenarioCount === 210);
+
+console.log('风险扫描：校验与纯函数：');
+const rk6 = risk(network, ['S1'], ['B'], { S1: -1 }, { B: 1 });
+check('负整数上限被拒绝', rk6.status === 'invalid' && rk6.errors.some((e) => e.includes('非负整数')));
+const rk7 = risk(network, ['NOPE'], ['B'], { NOPE: 1 }, { B: 1 });
+check('供水点不存在时报错', rk7.status === 'invalid');
+const beforeRisk = JSON.stringify(network);
+solver.scanValveClosureRisk(network, { supplies: ['S1', 'S2'], outlets: ['B', 'C', 'D'], supplyCaps: { S1: 5, S2: 3 }, outletDemands: { B: 2, C: 1, D: 1 } });
+check('扫描不修改输入网络与登记状态', JSON.stringify(network) === beforeRisk);
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);
