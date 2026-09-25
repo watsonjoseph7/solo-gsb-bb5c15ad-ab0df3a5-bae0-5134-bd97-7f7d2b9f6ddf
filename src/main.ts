@@ -6,11 +6,13 @@ import {
   verifyCapacity,
   verifyPriorityCapacity,
   suggestExpansion,
+  scanValveClosureRisks,
   locateValveAnomalies,
   planSingleValveObservers,
   MAX_OPEN_VALVES,
   EXPANSION_TARGET_CAPACITY,
   MAX_EXPANSION_PIPES,
+  MAX_RISK_SCAN_OPEN_VALVES,
   MAX_FLIPS,
   MAX_OBSERVER_CANDIDATES,
   type Query,
@@ -23,6 +25,7 @@ import {
   type PriorityCapacityResult,
   type ExpansionResult,
   type ExpansionPlan,
+  type ValveRiskResult,
   type AnomalyResult,
   type AnomalySolution,
   type ObserverPlanResult,
@@ -50,6 +53,8 @@ app.innerHTML = `
       还可做「供水能力核验」（按供给上限与出口需求量求总供给最大分配、缺口与限制总供给的最小割），
       可将部分保供出口标为「重点」做「重点出口优先配水」（先让重点出口总获配最大，再在此前提下让全部出口总获配最大），
       并能给出「管段增容建议」（在当前阀门状态下枚举将参与输水管段容量由 1 提至 2 的改造方案，最多改造两条）。
+      还可做「双阀意外关闭风险扫描」（仅对当前开启阀门模拟单阀或两阀意外关闭，最多 ${MAX_RISK_SCAN_OPEN_VALVES} 个开启阀门，
+      按同一共享容量模型重算各场景总获配，以比基线减少的数值作为新增缺口，双阀缺口严格大于两个单阀缺口之和时标记协同失供）。
       还可根据现场有水 / 无水观测做「阀门状态异常定位」（以登记的阀门开闭状态为基线，枚举最多 ${MAX_FLIPS} 处状态翻转来解释全部观测），
       并能做「单阀异常观测点规划」（把登记状态与每个阀门单独翻转作为假设，按候选观测节点的有水 / 无水签名归并不可区分组，
       并搜索能区分任意两组的最少观测点集合，最多填 ${MAX_OBSERVER_CANDIDATES} 个候选节点）。
@@ -86,7 +91,7 @@ app.innerHTML = `
         巡检沿用上方「供水点」与「保供出口」：无阀管段与开启的带阀管段均按单条失效计，
         已关阀不参与；多供水点作为整体，环路及并行管段分别计数。
       </p>
-      <h2>3. 供水能力核验、重点优先配水与管段增容</h2>
+      <h2>3. 供水能力核验、重点优先配水、管段增容与双阀风险扫描</h2>
       <p class="hint">
         为每个供水点填写非负整数<strong>供给上限</strong>、为每个保供出口填写非负整数<strong>需求量</strong>，
         并为每个保供出口选择<strong>重点 / 普通</strong>（默认普通），按当前阀门开闭状态求总供给最大分配
@@ -100,6 +105,7 @@ app.innerHTML = `
         <button id="verify-capacity" type="button" class="secondary">核验供水能力</button>
         <button id="priority-capacity" type="button" class="secondary">重点出口优先配水</button>
         <button id="suggest-expansion" type="button" class="secondary">管段增容建议</button>
+        <button id="scan-valve-risks" type="button" class="secondary">双阀意外关闭风险扫描</button>
       </div>
       <p class="hint">
         「重点出口优先配水」分两级目标：先使<strong>重点出口</strong>总获配量最大，再在<strong>不减少该值</strong>的前提下
@@ -111,6 +117,12 @@ app.innerHTML = `
         容量各由 1 提至 ${EXPANSION_TARGET_CAPACITY}，最多改造 ${MAX_EXPANSION_PIPES} 条；
         已关阀及自环不可选。分别计算不改造、单条与两条组合的总获配量，按
         「总获配量最高 → 改造条数最少 → 管段编号列表字典序最小」推荐方案。
+      </p>
+      <p class="hint">
+        「双阀意外关闭风险扫描」沿用同一份拓扑、登记阀门状态与填写表数值：仅对<strong>当前开启</strong>的阀门
+        （最多 ${MAX_RISK_SCAN_OPEN_VALVES} 个）模拟<strong>单阀或两阀意外关闭</strong>，按同一共享容量模型重算各场景总获配量，
+        以比基线减少的数值作为<strong>新增缺口</strong>，按「新增缺口降序 → 阀门编号列表字典序」展示全部有损场景；
+        双阀新增缺口严格大于两个对应单阀新增缺口之和时标记<strong>协同失供</strong>。扫描仅做场景测算，不改登记状态。
       </p>
       <h2>4. 阀门状态异常定位</h2>
       <p class="hint">
@@ -191,6 +203,16 @@ app.innerHTML = `
         </div>
       </section>
       <section class="panel result-panel">
+        <h2>双阀意外关闭风险扫描</h2>
+        <div id="risk-result">
+          <p class="hint">
+            点击「双阀意外关闭风险扫描」后，这里按「新增缺口降序 → 阀门编号列表字典序」列出全部有损场景
+            （单阀 / 双阀意外关闭后的总获配量与新增缺口）；双阀新增缺口严格大于两个对应单阀之和时标记「协同失供」；
+            无有损场景时会明确提示。
+          </p>
+        </div>
+      </section>
+      <section class="panel result-panel">
         <h2>阀门状态异常定位</h2>
         <div id="anomaly-result">
           <p class="hint">
@@ -232,6 +254,7 @@ const capacityFormEl = el<HTMLDivElement>('#capacity-form');
 const capacityResultEl = el<HTMLDivElement>('#capacity-result');
 const priorityResultEl = el<HTMLDivElement>('#priority-result');
 const expansionResultEl = el<HTMLDivElement>('#expansion-result');
+const riskResultEl = el<HTMLDivElement>('#risk-result');
 const anomalyResultEl = el<HTMLDivElement>('#anomaly-result');
 const observerResultEl = el<HTMLDivElement>('#observer-result');
 
@@ -726,6 +749,76 @@ function renderExpansion(result: ExpansionResult): void {
     </p>`;
 }
 
+function renderValveRisks(result: ValveRiskResult): void {
+  if (result.status === 'invalid') {
+    renderErrors(riskResultEl, '输入有误，无法扫描：', result.errors);
+    return;
+  }
+
+  const pairCount = result.scenarioCount - result.openValveCount;
+  const scopeHint = `
+    <p class="hint">
+      仅对当前开启的阀门（${result.openValveCount} 个，上限 ${MAX_RISK_SCAN_OPEN_VALVES} 个）模拟意外关闭，
+      已关阀不参与；共模拟 ${result.scenarioCount} 个场景（${result.openValveCount} 个单阀 + ${pairCount} 个双阀），
+      每个场景按与「供水能力核验」相同的无向管段共享容量模型重算总获配量；扫描不改登记状态。
+    </p>`;
+
+  // 无有损场景：明确提示
+  if (result.scenarios.length === 0) {
+    riskResultEl.innerHTML = `
+      <div class="banner success">
+        未发现失供风险：全部 <strong>${result.scenarioCount}</strong> 个模拟场景的总获配量均不低于基线
+        <strong>${result.baseline}</strong>——任意一个或两个当前开启阀门意外关闭都不会产生新增缺口。
+      </div>
+      ${scopeHint}`;
+    return;
+  }
+
+  const synergisticCount = result.scenarios.filter((s) => s.synergistic).length;
+  const rows = result.scenarios
+    .map((s) => {
+      const valves = s.closed.map((v) => `<code>${escapeHtml(v)}</code>`).join('、');
+      const kindTag =
+        s.closed.length === 1
+          ? '<span class="tag tag-normal">单阀</span>'
+          : '<span class="tag tag-low">双阀</span>';
+      const verdict = s.synergistic
+        ? '<span class="tag tag-cut">协同失供</span>'
+        : '<span class="hint">—</span>';
+      return `
+        <tr>
+          <td>${valves}</td>
+          <td>${kindTag}</td>
+          <td class="num">${s.totalAllocated}</td>
+          <td class="num bad"><strong>+${s.newShortfall}</strong></td>
+          <td>${verdict}</td>
+        </tr>`;
+    })
+    .join('');
+
+  const worst = result.scenarios[0];
+  riskResultEl.innerHTML = `
+    <div class="banner warn">
+      发现 <strong>${result.scenarios.length}</strong> 个有损场景（共模拟 ${result.scenarioCount} 个）：
+      基线总获配 <strong>${result.baseline}</strong>，最严重场景为
+      ${worst.closed.map((v) => `<code>${escapeHtml(v)}</code>`).join('、')}
+      意外关闭，总获配降至 <strong>${worst.totalAllocated}</strong>，新增缺口
+      <strong>${worst.newShortfall}</strong>。
+      ${synergisticCount > 0 ? `其中 <strong>${synergisticCount}</strong> 个双阀场景为协同失供。` : '无协同失供场景。'}
+    </div>
+    <table>
+      <thead>
+        <tr><th>意外关闭阀门</th><th>场景</th><th>场景总获配量</th><th>新增缺口</th><th>协同失供</th></tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <p class="hint">
+      新增缺口 = 基线总获配（${result.baseline}）− 场景总获配，按新增缺口降序、阀门编号列表字典序排列；
+      「协同失供」指双阀场景的新增缺口严格大于两个对应单阀场景新增缺口之和（两阀互为备份、同时关闭才失供）。
+    </p>
+    ${scopeHint}`;
+}
+
 function renderAnomaly(result: AnomalyResult): void {
   if (result.status === 'invalid') {
     renderErrors(anomalyResultEl, '输入有误，无法定位：', result.errors);
@@ -1033,6 +1126,31 @@ function runPriorityCapacity(): void {
   }
 }
 
+function runValveRiskScan(): void {
+  try {
+    const network = readNetwork();
+    if (!capacityFormState) {
+      renderErrors(riskResultEl, '请先填写核验数值：', ['点击「按上方供水点 / 保供出口生成填写表」，为各点填写非负整数后再扫描。']);
+      return;
+    }
+    const { supplyCaps, outletDemands, errors: formErrors } = readCapacityNumbers();
+    if (formErrors.length > 0) {
+      renderErrors(riskResultEl, '填写有误：', formErrors);
+      return;
+    }
+    // 与供水能力核验共用同一份拓扑、登记阀门状态与供给上限 / 出口需求（填写表为权威名单）
+    const capacityQuery: CapacityQuery = {
+      supplies: capacityFormState.supplies,
+      outlets: capacityFormState.outlets,
+      supplyCaps,
+      outletDemands,
+    };
+    renderValveRisks(scanValveClosureRisks(network, capacityQuery));
+  } catch (e) {
+    renderErrors(riskResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+  }
+}
+
 function runAnomaly(): void {
   try {
     const network = readNetwork();
@@ -1082,6 +1200,7 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   runCapacity();
   runPriorityCapacity();
   runExpansion();
+  runValveRiskScan();
   runAnomaly();
   runObserverPlan();
 });
@@ -1091,6 +1210,7 @@ el<HTMLButtonElement>('#inspect').addEventListener('click', runInspection);
 el<HTMLButtonElement>('#verify-capacity').addEventListener('click', runCapacity);
 el<HTMLButtonElement>('#priority-capacity').addEventListener('click', runPriorityCapacity);
 el<HTMLButtonElement>('#suggest-expansion').addEventListener('click', runExpansion);
+el<HTMLButtonElement>('#scan-valve-risks').addEventListener('click', runValveRiskScan);
 el<HTMLButtonElement>('#locate-anomaly').addEventListener('click', runAnomaly);
 el<HTMLButtonElement>('#plan-observers').addEventListener('click', runObserverPlan);
 el<HTMLButtonElement>('#build-capacity-form').addEventListener('click', () => {
